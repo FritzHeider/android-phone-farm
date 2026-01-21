@@ -1,0 +1,12 @@
+id: "youtube_open"
+title: "Open YouTube"
+description: "Opens YouTube on the selected phones and waits briefly so the app can load."
+operator_note: "This preset does not automate views or engagement. It only opens the app for manual review."
+steps:
+  - type: LAUNCH_APP
+    label: "Open YouTube"
+    package: "com.google.android.youtube"
+  - type: WAIT
+    label: "Let YouTube load"
+    min_seconds: 3
+    max_seconds: 6

@@ -1,0 +1,12 @@
+id: "x_open"
+title: "Open X (Twitter)"
+description: "Opens X (Twitter) on the selected phones and waits briefly so the app can load."
+operator_note: "This preset does not post, like, follow, or message. It only opens the app for manual review."
+steps:
+  - type: LAUNCH_APP
+    label: "Open X"
+    package: "com.twitter.android"
+  - type: WAIT
+    label: "Let X load"
+    min_seconds: 3
+    max_seconds: 6

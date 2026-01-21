@@ -1,0 +1,12 @@
+id: "tiktok_open"
+title: "Open TikTok"
+description: "Opens TikTok on the selected phones and waits briefly so the app can load."
+operator_note: "This preset does not automate engagement. It only opens the app for manual review."
+steps:
+  - type: LAUNCH_APP
+    label: "Open TikTok"
+    package: "com.zhiliaoapp.musically"
+  - type: WAIT
+    label: "Let TikTok load"
+    min_seconds: 3
+    max_seconds: 6

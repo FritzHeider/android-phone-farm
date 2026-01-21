@@ -1,0 +1,15 @@
+id: "web_preview"
+title: "Open Website (Example)"
+description: "Opens a sample website in the default browser and captures a screenshot."
+operator_note: "Use the GUI 'Open Website' button to enter a custom URL. This preset uses https://example.com as a safe placeholder."
+steps:
+  - type: OPEN_URL
+    label: "Open example.com"
+    url: "https://example.com"
+  - type: WAIT
+    label: "Let the page load"
+    min_seconds: 3
+    max_seconds: 6
+  - type: SCREENSHOT
+    label: "Capture a screenshot"
+    filename: "web.png"

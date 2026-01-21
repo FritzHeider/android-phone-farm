@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.dist/
+.build/
+.venv/
+
+# Local data
+/data/
+/logs/*.log
+/logs/*.log.*
+/logs/backend.stdout.log
+
+# OS
+.DS_Store

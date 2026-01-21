@@ -1,0 +1,610 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Android Phone Farm CLI wrapper (macOS + zsh)
+#
+# This script:
+# - starts/stops the backend
+# - provides safe command shortcuts
+# - never calls adb directly (backend only)
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+ROOT_DIR=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+
+DEFAULT_HOST=${PHONE_FARM_HOST:-127.0.0.1}
+DEFAULT_PORT=${PHONE_FARM_PORT:-8765}
+BASE_URL="http://${DEFAULT_HOST}:${DEFAULT_PORT}"
+
+CONFIG_PATH=${PHONE_FARM_CONFIG:-"${ROOT_DIR}/config/farm.yaml"}
+DATA_DIR="${ROOT_DIR}/data"
+LOG_DIR="${ROOT_DIR}/logs"
+PID_FILE="${DATA_DIR}/backend.pid"
+STDOUT_LOG="${LOG_DIR}/backend.stdout.log"
+
+PYTHON_BIN=""
+if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+  PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+elif [[ -x "${ROOT_DIR}/.venv/bin/python3" ]]; then
+  PYTHON_BIN="${ROOT_DIR}/.venv/bin/python3"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
+  echo "ERROR: python3 not found. Install Python 3.11+." >&2
+  exit 1
+fi
+
+mkdir -p "${DATA_DIR}" "${LOG_DIR}"
+
+function usage() {
+  cat <<'USAGE'
+Android Phone Farm (macOS)
+
+Usage:
+  ./bin/farm start
+  ./bin/farm stop
+  ./bin/farm status
+  ./bin/farm devices
+  ./bin/farm selection
+  ./bin/farm select all|none|<serial...>
+  ./bin/farm select --state READY|BUSY|COOLING|UNRESPONSIVE|NEEDS_ATTENTION
+  ./bin/farm campaign list
+  ./bin/farm campaign start <campaign_id> [--selected|--all|--serials <serial...>]
+  ./bin/farm emergency-stop
+  ./bin/farm usb restart-adb
+  ./bin/farm cooldown start <seconds> [--selected|--all]
+  ./bin/farm cooldown stop [--selected|--all]
+  ./bin/farm gui
+  ./bin/farm tui
+  ./bin/farm logs [lines]
+
+Environment:
+  PHONE_FARM_HOST, PHONE_FARM_PORT, PHONE_FARM_CONFIG
+
+Notes:
+  - This script never calls adb directly.
+  - It only talks to the local backend API.
+USAGE
+}
+
+function api_get() {
+  local path="$1"
+  curl -fsS "${BASE_URL}${path}"
+}
+
+function api_post_json() {
+  local path="$1"
+  local json="$2"
+  curl -fsS -X POST -H 'Content-Type: application/json' "${BASE_URL}${path}" -d "${json}"
+}
+
+function api_post_empty() {
+  local path="$1"
+  curl -fsS -X POST "${BASE_URL}${path}"
+}
+
+function backend_running() {
+  if [[ -f "${PID_FILE}" ]]; then
+    local pid
+    pid=$(cat "${PID_FILE}" 2>/dev/null || true)
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+function wait_for_backend() {
+  local tries=40
+  local i=1
+  while [[ $i -le $tries ]]; do
+    if curl -fsS "${BASE_URL}/api/v1/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.15
+    i=$((i+1))
+  done
+  return 1
+}
+
+function cmd_start() {
+  if backend_running; then
+    echo "Backend already running."
+    return 0
+  fi
+
+  echo "Starting backend..."
+  export PHONE_FARM_HOST="${DEFAULT_HOST}"
+  export PHONE_FARM_PORT="${DEFAULT_PORT}"
+  export PHONE_FARM_CONFIG="${CONFIG_PATH}"
+
+  # Run in background with a predictable PID.
+  nohup "${PYTHON_BIN}" -m backend >>"${STDOUT_LOG}" 2>&1 &
+  echo $! >"${PID_FILE}"
+
+  if wait_for_backend; then
+    echo "Backend is up: ${BASE_URL}"
+    return 0
+  fi
+
+  echo "ERROR: backend did not become healthy. Check logs: ${STDOUT_LOG}" >&2
+  exit 1
+}
+
+function cmd_stop() {
+  if ! backend_running; then
+    echo "Backend is not running."
+    rm -f "${PID_FILE}" || true
+    return 0
+  fi
+
+  local pid
+  pid=$(cat "${PID_FILE}")
+  echo "Stopping backend (pid ${pid})..."
+  kill "${pid}" >/dev/null 2>&1 || true
+
+  local tries=40
+  local i=1
+  while [[ $i -le $tries ]]; do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      rm -f "${PID_FILE}" || true
+      echo "Stopped."
+      return 0
+    fi
+    sleep 0.1
+    i=$((i+1))
+  done
+
+  echo "Backend still running; sending SIGKILL..."
+  kill -9 "${pid}" >/dev/null 2>&1 || true
+  rm -f "${PID_FILE}" || true
+  echo "Stopped."
+}
+
+function cmd_status() {
+  if backend_running; then
+    echo "Backend process: running"
+  else
+    echo "Backend process: not running"
+  fi
+
+  if curl -fsS "${BASE_URL}/api/v1/health" >/dev/null 2>&1; then
+    echo "Backend API: healthy (${BASE_URL})"
+  else
+    echo "Backend API: unreachable (${BASE_URL})"
+  fi
+}
+
+function cmd_devices() {
+  cmd_start >/dev/null 2>&1 || true
+  api_get "/api/v1/devices" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception as e:
+    print("Failed to parse JSON:", e)
+    sys.exit(1)
+
+# Sort by name then serial
+items = sorted(data, key=lambda d: (d.get("meta", {}).get("name") or d.get("meta", {}).get("serial"), d.get("meta", {}).get("serial")))
+
+for d in items:
+    meta = d.get("meta", {})
+    rt = d.get("runtime", {})
+    name = meta.get("name") or meta.get("serial")
+    serial = meta.get("serial")
+    state = rt.get("state")
+    task = rt.get("current_task_label") or ""
+    err = rt.get("last_error") or ""
+    line = f"{name:<18} {serial:<18} {state:<15} {task:<22}"
+    if err:
+        line += f"  ERR: {err}"
+    print(line)
+PY
+}
+
+function cmd_selection() {
+  cmd_start >/dev/null 2>&1 || true
+  api_get "/api/v1/selection" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+data=json.load(sys.stdin)
+serials=data.get("device_serials", [])
+print(f"Selected ({len(serials)}):")
+for s in serials:
+    print("  "+s)
+PY
+}
+
+function _fetch_serials_all() {
+  api_get "/api/v1/devices" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+data=json.load(sys.stdin)
+serials=[d["meta"]["serial"] for d in data]
+print(" ".join(serials))
+PY
+}
+
+function _fetch_serials_state() {
+  local wanted="$1"
+  api_get "/api/v1/devices" | "${PYTHON_BIN}" - <<'PY'
+import json, sys, os
+wanted=os.environ.get("WANTED_STATE", "")
+data=json.load(sys.stdin)
+serials=[d["meta"]["serial"] for d in data if d.get("runtime",{}).get("state")==wanted]
+print(" ".join(serials))
+PY
+}
+
+function cmd_select() {
+  cmd_start >/dev/null 2>&1 || true
+
+  if [[ $# -lt 1 ]]; then
+    echo "ERROR: select requires arguments." >&2
+    usage
+    exit 1
+  fi
+
+  local arg="$1"
+  shift || true
+
+  local serials=()
+
+  if [[ "${arg}" == "all" ]]; then
+    local s
+    s=$(_fetch_serials_all)
+    serials=(${=s})
+  elif [[ "${arg}" == "none" ]]; then
+    api_post_empty "/api/v1/selection/clear" >/dev/null
+    echo "Selection cleared."
+    return 0
+  elif [[ "${arg}" == "--state" ]]; then
+    if [[ $# -lt 1 ]]; then
+      echo "ERROR: select --state requires a state." >&2
+      exit 1
+    fi
+    local st="$1"
+    shift || true
+    export WANTED_STATE="${st}"
+    local s
+    s=$(_fetch_serials_state "${st}")
+    serials=(${=s})
+  else
+    # treat arg as first serial
+    serials=("${arg}")
+    if [[ $# -gt 0 ]]; then
+      serials+=("$@")
+    fi
+  fi
+
+  local json
+  json=$("${PYTHON_BIN}" - <<'PY'
+import json, os
+serials=os.environ.get("SERIALS","").split()
+print(json.dumps({"device_serials": serials}))
+PY
+  SERIALS="${serials[*]}")
+
+  api_post_json "/api/v1/selection" "${json}" >/dev/null
+  echo "Selected ${#serials[@]} device(s)."
+}
+
+function cmd_campaign_list() {
+  cmd_start >/dev/null 2>&1 || true
+  api_get "/api/v1/campaigns" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+data=json.load(sys.stdin)
+for c in data.get("campaigns", []):
+    print(f"{c.get('id'):<18}  {c.get('title')}")
+PY
+}
+
+function _get_current_selection_serials() {
+  api_get "/api/v1/selection" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+data=json.load(sys.stdin)
+serials=data.get("device_serials", [])
+print(" ".join(serials))
+PY
+}
+
+function cmd_campaign_start() {
+  cmd_start >/dev/null 2>&1 || true
+
+  if [[ $# -lt 1 ]]; then
+    echo "ERROR: campaign start requires <campaign_id>." >&2
+    exit 1
+  fi
+
+  local campaign_id="$1"
+  shift || true
+
+  local mode="selected"
+  local serials=()
+
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "--all" ]]; then
+      mode="all"
+      shift
+    elif [[ "$1" == "--selected" ]]; then
+      mode="selected"
+      shift
+    elif [[ "$1" == "--serials" ]]; then
+      mode="serials"
+      shift
+      if [[ $# -lt 1 ]]; then
+        echo "ERROR: --serials requires at least one serial" >&2
+        exit 1
+      fi
+      serials=("$@")
+    fi
+  fi
+
+  if [[ "${mode}" == "all" ]]; then
+    local s
+    s=$(_fetch_serials_all)
+    serials=(${=s})
+  elif [[ "${mode}" == "selected" ]]; then
+    local s
+    s=$(_get_current_selection_serials)
+    serials=(${=s})
+  fi
+
+  if [[ ${#serials[@]} -lt 1 ]]; then
+    echo "ERROR: No devices selected." >&2
+    exit 1
+  fi
+
+  local json
+  json=$("${PYTHON_BIN}" - <<'PY'
+import json, os
+campaign_id=os.environ["CAMPAIGN_ID"]
+serials=os.environ.get("SERIALS","").split()
+print(json.dumps({"campaign_id": campaign_id, "device_serials": serials}))
+PY
+  CAMPAIGN_ID="${campaign_id}" SERIALS="${serials[*]}")
+
+  api_post_json "/api/v1/campaigns/run" "${json}" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+data=json.load(sys.stdin)
+print(data.get("message"))
+if data.get("data", {}).get("task_ids"):
+    for tid in data["data"]["task_ids"]:
+        print("  " + tid)
+PY
+}
+
+function cmd_emergency_stop() {
+  cmd_start >/dev/null 2>&1 || true
+  api_post_empty "/api/v1/emergency_stop" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+print(json.load(sys.stdin).get("message"))
+PY
+}
+
+function cmd_usb_restart_adb() {
+  cmd_start >/dev/null 2>&1 || true
+  api_post_empty "/api/v1/usb/restart_adb" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+print(json.load(sys.stdin).get("message"))
+PY
+}
+
+function cmd_cooldown_start() {
+  cmd_start >/dev/null 2>&1 || true
+
+  if [[ $# -lt 1 ]]; then
+    echo "ERROR: cooldown start <seconds>" >&2
+    exit 1
+  fi
+
+  local seconds="$1"
+  shift || true
+
+  local mode="selected"
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "--all" ]]; then
+      mode="all"
+      shift
+    elif [[ "$1" == "--selected" ]]; then
+      mode="selected"
+      shift
+    fi
+  fi
+
+  local serials=()
+  if [[ "${mode}" == "all" ]]; then
+    local s
+    s=$(_fetch_serials_all)
+    serials=(${=s})
+  else
+    local s
+    s=$(_get_current_selection_serials)
+    serials=(${=s})
+  fi
+
+  if [[ ${#serials[@]} -lt 1 ]]; then
+    echo "ERROR: No devices selected." >&2
+    exit 1
+  fi
+
+  local json
+  json=$("${PYTHON_BIN}" - <<'PY'
+import json, os
+serials=os.environ.get("SERIALS","").split()
+seconds=int(os.environ.get("SECONDS","60"))
+print(json.dumps({"device_serials": serials, "seconds": seconds}))
+PY
+  SERIALS="${serials[*]}" SECONDS="${seconds}")
+
+  api_post_json "/api/v1/cooldown/start" "${json}" >/dev/null
+  echo "Cooldown started for ${#serials[@]} device(s) for ${seconds}s."
+}
+
+function cmd_cooldown_stop() {
+  cmd_start >/dev/null 2>&1 || true
+
+  local mode="selected"
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "--all" ]]; then
+      mode="all"
+      shift
+    elif [[ "$1" == "--selected" ]]; then
+      mode="selected"
+      shift
+    fi
+  fi
+
+  local serials=()
+  if [[ "${mode}" == "all" ]]; then
+    local s
+    s=$(_fetch_serials_all)
+    serials=(${=s})
+  else
+    local s
+    s=$(_get_current_selection_serials)
+    serials=(${=s})
+  fi
+
+  if [[ ${#serials[@]} -lt 1 ]]; then
+    echo "ERROR: No devices selected." >&2
+    exit 1
+  fi
+
+  local json
+  json=$("${PYTHON_BIN}" - <<'PY'
+import json, os
+serials=os.environ.get("SERIALS","").split()
+print(json.dumps({"device_serials": serials}))
+PY
+  SERIALS="${serials[*]}")
+
+  api_post_json "/api/v1/cooldown/stop" "${json}" >/dev/null
+  echo "Cooldown stopped for ${#serials[@]} device(s)."
+}
+
+function cmd_gui() {
+  cmd_start >/dev/null 2>&1 || true
+  exec "${PYTHON_BIN}" -m gui
+}
+
+function cmd_tui() {
+  cmd_start >/dev/null 2>&1 || true
+  exec "${PYTHON_BIN}" -m tui
+}
+
+function cmd_logs() {
+  cmd_start >/dev/null 2>&1 || true
+  local lines=${1:-200}
+  api_get "/api/v1/logs/tail?lines=${lines}" | "${PYTHON_BIN}" - <<'PY'
+import json, sys
+data=json.load(sys.stdin)
+print(data.get("path"))
+print("-"*60)
+for ln in data.get("lines", []):
+    print(ln)
+PY
+}
+
+# ----- Router -----
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 0
+fi
+
+cmd="$1"
+shift || true
+
+case "$cmd" in
+  start)
+    cmd_start
+    ;;
+  stop)
+    cmd_stop
+    ;;
+  status)
+    cmd_status
+    ;;
+  devices)
+    cmd_devices
+    ;;
+  selection)
+    cmd_selection
+    ;;
+  select)
+    cmd_select "$@"
+    ;;
+  campaign)
+    if [[ $# -lt 1 ]]; then
+      usage
+      exit 1
+    fi
+    sub="$1"; shift || true
+    case "$sub" in
+      list)
+        cmd_campaign_list
+        ;;
+      start)
+        cmd_campaign_start "$@"
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  emergency-stop)
+    cmd_emergency_stop
+    ;;
+  usb)
+    if [[ $# -lt 1 ]]; then
+      usage
+      exit 1
+    fi
+    sub="$1"; shift || true
+    case "$sub" in
+      restart-adb)
+        cmd_usb_restart_adb
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  cooldown)
+    if [[ $# -lt 1 ]]; then
+      usage
+      exit 1
+    fi
+    sub="$1"; shift || true
+    case "$sub" in
+      start)
+        cmd_cooldown_start "$@"
+        ;;
+      stop)
+        cmd_cooldown_stop "$@"
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  gui)
+    cmd_gui
+    ;;
+  tui)
+    cmd_tui
+    ;;
+  logs)
+    cmd_logs "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac

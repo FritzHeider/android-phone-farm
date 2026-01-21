@@ -1,0 +1,12 @@
+id: "facebook_open"
+title: "Open Facebook"
+description: "Opens Facebook on the selected phones and waits briefly so the app can load."
+operator_note: "This preset does not automate posting or engagement. It only opens the app for manual review."
+steps:
+  - type: LAUNCH_APP
+    label: "Open Facebook"
+    package: "com.facebook.katana"
+  - type: WAIT
+    label: "Let Facebook load"
+    min_seconds: 3
+    max_seconds: 6

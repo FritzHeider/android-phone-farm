@@ -1,0 +1,7 @@
+id: "see_screens"
+title: "See Screens (scrcpy)"
+description: "Opens a scrcpy window for each selected phone for manual viewing/control."
+operator_note: "Each phone opens in its own scrcpy window. Close windows when done."
+steps:
+  - type: START_SCRCPY
+    label: "Open scrcpy"

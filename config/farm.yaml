@@ -1,0 +1,42 @@
+server:
+  host: "127.0.0.1"
+  port: 8765
+
+paths:
+  data_dir: "./data"
+  logs_dir: "./logs"
+  campaigns_dir: "./campaigns"
+
+adb:
+  # If adb isn't in PATH, set this to the full path, e.g. /opt/homebrew/bin/adb
+  adb_path: "adb"
+  default_timeout_sec: 20
+  refresh_interval_sec: 2
+
+scrcpy:
+  enabled: true
+  scrcpy_path: "scrcpy"
+
+usb:
+  # Without a microcontroller, per-phone power cycling isn't guaranteed.
+  # This optional hook lets you call a hub power cycle tool (if you have one).
+  hub_power_cycle:
+    enabled: false
+    # Command must be a YAML list (no shell). The backend will substitute {hub_id}.
+    # Example (uhubctl on Linux; on macOS you may have a vendor-specific tool):
+    # command: ["/usr/local/bin/uhubctl", "-l", "{hub_id}", "-a", "cycle"]
+    command: []
+
+watchdog:
+  enabled: true
+  check_interval_sec: 8
+  unresponsive_threshold_sec: 20
+  max_recovery_attempts: 3
+
+# Optional: assign friendly names/tags by ADB serial.
+# devices:
+#   "R58M1234ABC":
+#     name: "Phone 01"
+#     tags: ["team-a", "review"]
+
+devices: {}
